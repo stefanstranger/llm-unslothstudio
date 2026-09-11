@@ -132,6 +132,24 @@ uv publish
 Remove-Item Env:UV_PUBLISH_TOKEN
 ```
 
+## Automated releases with GitHub Actions
+
+The [publish workflow](.github/workflows/publish.yml) runs when a GitHub Release
+is published and can also be started manually. It builds and checks the
+distributions in a separate job, then publishes them through PyPI Trusted
+Publishing without a stored API token.
+
+Before using the workflow:
+
+1. Create a `pypi` GitHub Environment in the repository settings, optionally
+   with required reviewers.
+2. Register this repository and `.github/workflows/publish.yml` as a trusted
+   publisher at <https://pypi.org/manage/account/publishing/>.
+
+If Trusted Publishing is not configured yet, use the manual token process
+above. Do not add a token to the workflow unless it is passed through a GitHub
+Actions secret such as `PYPI_API_TOKEN`.
+
 ## 8) Verify release
 
 Open the project page:
