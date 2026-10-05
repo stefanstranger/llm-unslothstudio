@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -41,6 +43,8 @@ import llm
 
 assert llm.get_model("local-model").model_id == "unsloth:local-model"
 assert llm.get_async_model("local-model").model_id == "unsloth:local-model"
+assert llm.get_model("unsloth-decision").model_id == "unsloth:decision"
+assert llm.get_async_model("unsloth-decision").model_id == "unsloth:decision"
 assert calls == 2
 """
     environment = os.environ.copy()
@@ -72,6 +76,26 @@ def test_registers_discovered_model_with_aliases(monkeypatch):
     assert async_model.model_id == "unsloth:local-model"
     assert model.model_name == "local-model"
     assert kwargs["aliases"] == ("local-model", "unsloth")
+
+    (decision_model, async_decision_model), kwargs = registered[1]
+    assert decision_model.model_id == "unsloth:decision"
+    assert async_decision_model.model_id == "unsloth:decision"
+    assert kwargs["aliases"] == ("unsloth-decision",)
+
+
+def test_registers_decision_model_without_discovered_chat_models(monkeypatch):
+    monkeypatch.setattr(llm_unslothstudio, "discover_model_ids", lambda: [])
+    registered = []
+
+    llm_unslothstudio.register_models(
+        lambda *args, **kwargs: registered.append((args, kwargs))
+    )
+
+    assert len(registered) == 1
+    (model, async_model), kwargs = registered[0]
+    assert model.model_id == "unsloth:decision"
+    assert async_model.model_id == "unsloth:decision"
+    assert kwargs["aliases"] == ("unsloth-decision",)
 
 
 def test_non_streaming_chat_completion(monkeypatch):
@@ -169,3 +193,136 @@ def test_streaming_chat_completion(monkeypatch):
     assert response.text() == "Hello!"
     assert response.usage().input == 2
     assert response.usage().output == 1
+
+
+def test_decision_request_with_state_and_questions_option(monkeypatch):
+    requests = []
+
+    def post(url, **kwargs):
+        requests.append((url, kwargs))
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={
+                "model": "laya-multilingual",
+                "answers": {
+                    "refund": {
+                        "type": "noul",
+                        "noul": 0.9794,
+                    }
+                },
+                "usage": {"input_tokens": 172, "output_tokens": 0},
+            },
+        )
+
+    monkeypatch.setattr(llm_unslothstudio.httpx, "post", post)
+    model = llm_unslothstudio.UnslothDecision()
+    key = "test-token"
+    questions = {
+        "refund": {
+            "type": "noul",
+            "instructions": "Does the customer ask for a refund?",
+        }
+    }
+
+    response = model.prompt(
+        "Please refund the duplicate charge.",
+        key=key,
+        stream=False,
+        questions=json.dumps(questions),
+        decision_model="laya-multilingual",
+    )
+
+    data = json.loads(response.text())
+    assert data["answers"]["refund"]["noul"] == 0.9794
+    assert requests[0][0] == f"{llm_unslothstudio.api_base_url()}/systemone"
+    assert requests[0][1]["headers"]["Authorization"] == "Bearer " + key
+    assert requests[0][1]["json"] == {
+        "model": "laya-multilingual",
+        "state": "Please refund the duplicate charge.",
+        "questions": questions,
+    }
+    assert requests[0][1]["timeout"] == llm_unslothstudio.DECISION_TIMEOUT
+    assert response.usage().input == 172
+    assert response.usage().output == 0
+
+
+def test_decision_request_accepts_complete_json_payload(monkeypatch):
+    requests = []
+
+    def post(url, **kwargs):
+        requests.append(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"answers": {}, "usage": {}},
+        )
+
+    monkeypatch.setattr(llm_unslothstudio.httpx, "post", post)
+    model = llm_unslothstudio.UnslothDecision()
+    payload = {
+        "state": {"ticket": "Duplicate charge"},
+        "questions": {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team?",
+                "criteria": {"billing": "payments", "other": "everything else"},
+            }
+        },
+    }
+
+    response = model.prompt(
+        json.dumps(payload),
+        key="sk-unsloth-test",
+        stream=False,
+    )
+
+    assert json.loads(response.text())["answers"] == {}
+    assert requests[0] == {"model": "laya", **payload}
+
+
+def test_async_decision_request(monkeypatch):
+    requests = []
+
+    class AsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return None
+
+        async def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "answers": {"refund": {"type": "noul", "noul": 0.8}},
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            )
+
+    monkeypatch.setattr(llm_unslothstudio.httpx, "AsyncClient", AsyncClient)
+    model = llm_unslothstudio.AsyncUnslothDecision()
+
+    async def run():
+        response = model.prompt(
+            "Refund this charge",
+            key="sk-unsloth-test",
+            stream=False,
+            questions={
+                "refund": {
+                    "type": "noul",
+                    "instructions": "Is a refund requested?",
+                }
+            },
+        )
+        text = await response.text()
+        return text, await response.usage()
+
+    text, usage = asyncio.run(run())
+
+    assert json.loads(text)["answers"]["refund"]["noul"] == 0.8
+    assert requests[0][0] == f"{llm_unslothstudio.api_base_url()}/systemone"
+    assert usage.input == 10
+    assert usage.output == 0
